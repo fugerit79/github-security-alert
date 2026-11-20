@@ -1,0 +1,246 @@
+name: High-Impact CVE Watchdog
+
+on:
+  schedule:
+    # Runs every day at 07:00 UTC
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Number of days to look back in the CISA KEV catalog'
+        required: false
+        default: '2'
+        type: string
+      dry_run:
+        description: 'Run analysis without creating GitHub issues'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: cisa-kev-high-epss-check
+  cancel-in-progress: false
+
+jobs:
+  check-critical-cve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Fetch and Analyze CISA KEV & EPSS Vulnerabilities
+        id: fetch-cve
+        env:
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '2' }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          USER_AGENT = "github-security-alert/1.0 (+https://github.com/fugerit79/github-security-alert)"
+          CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+          EPSS_API_URL = "https://api.first.org/data/v1/epss"
+          OUTPUT_FILE = "alert_cves.json"
+
+
+          def set_output(name: str, value: str) -> None:
+              github_output = os.environ.get("GITHUB_OUTPUT")
+              if github_output:
+                  with open(github_output, "a", encoding="utf-8") as fh:
+                      fh.write(f"{name}={value}\n")
+
+
+          def parse_lookback_days() -> int:
+              raw = os.environ.get("LOOKBACK_DAYS", "2").strip()
+              try:
+                  days = int(raw)
+              except ValueError:
+                  print(f"::error::Invalid lookback_days value: {raw!r} (must be an integer between 1 and 365)")
+                  sys.exit(1)
+              if not 1 <= days <= 365:
+                  print(f"::error::lookback_days out of range: {days} (must be between 1 and 365)")
+                  sys.exit(1)
+              return days
+
+
+          def fetch_json(url: str, timeout: int = 30) -> dict:
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+
+          def fetch_epss_scores(cve_ids: list[str]) -> dict[str, dict[str, str]]:
+              scores: dict[str, dict[str, str]] = {}
+              batch_size = 50
+              for i in range(0, len(cve_ids), batch_size):
+                  batch = cve_ids[i : i + batch_size]
+                  query = urllib.parse.urlencode({"cve": ",".join(batch)})
+                  try:
+                      payload = fetch_json(f"{EPSS_API_URL}?{query}", timeout=20)
+                      for item in payload.get("data", []):
+                          cve = item.get("cve")
+                          if cve:
+                              scores[cve] = {
+                                  "epss": item.get("epss", ""),
+                                  "percentile": item.get("percentile", ""),
+                              }
+                  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      print(f"::warning::Unable to fetch EPSS scores for batch starting at index {i}: {exc}")
+              return scores
+
+
+          lookback_days = parse_lookback_days()
+
+          try:
+              data = fetch_json(CISA_KEV_URL, timeout=30)
+          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+              print(f"::error::Failed to fetch or parse CISA KEV catalog: {exc}")
+              sys.exit(1)
+
+          cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+          print(f"CISA KEV catalog version: {data.get('catalogVersion', 'unknown')} | Cutoff date (UTC): {cutoff}")
+
+          high_impact_cves = [
+              vuln
+              for vuln in data.get("vulnerabilities", [])
+              if vuln.get("dateAdded", "") >= cutoff and vuln.get("cveID")
+          ]
+          high_impact_cves.sort(key=lambda v: (v.get("dateAdded", ""), v.get("cveID", "")), reverse=True)
+
+          if not high_impact_cves:
+              print(f"Nessuna CVE critica nel catalogo CISA KEV rilevata negli ultimi {lookback_days} giorni.")
+              set_output("has_alerts", "false")
+              set_output("alert_count", "0")
+              sys.exit(0)
+
+          epss_map = fetch_epss_scores([v["cveID"] for v in high_impact_cves])
+
+          enriched_cves = []
+          print(f"::warning::Rilevate {len(high_impact_cves)} CVE nel catalogo CISA KEV negli ultimi {lookback_days} giorni!")
+          for v in high_impact_cves:
+              cve_id = v["cveID"]
+              epss_info = epss_map.get(cve_id, {})
+              entry = {
+                  "cveID": cve_id,
+                  "vendorProject": v.get("vendorProject", "Unknown"),
+                  "product": v.get("product", "Unknown"),
+                  "vulnerabilityName": v.get("vulnerabilityName", "N/A"),
+                  "dateAdded": v.get("dateAdded", "N/A"),
+                  "dueDate": v.get("dueDate", "N/A"),
+                  "requiredAction": v.get("requiredAction", "Apply vendor patch or mitigation."),
+                  "knownRansomwareCampaignUse": v.get("knownRansomwareCampaignUse", "Unknown"),
+                  "shortDescription": v.get("shortDescription", ""),
+                  "epss": epss_info.get("epss", ""),
+                  "epssPercentile": epss_info.get("percentile", ""),
+              }
+              enriched_cves.append(entry)
+              print(
+                  f"- {entry['cveID']} | {entry['vendorProject']} / {entry['product']} | "
+                  f"Added: {entry['dateAdded']} | EPSS: {entry['epss'] or 'N/A'}"
+              )
+
+          with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
+              json.dump(enriched_cves, fh, ensure_ascii=False, indent=2)
+
+          set_output("has_alerts", "true")
+          set_output("alert_count", str(len(enriched_cves)))
+          EOF
+
+      - name: Notify on GitHub Issues
+        if: steps.fetch-cve.outputs.has_alerts == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '2' }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const cves = JSON.parse(fs.readFileSync('alert_cves.json', 'utf8'));
+            const dryRun = process.env.DRY_RUN === 'true';
+            const lookbackDays = process.env.LOOKBACK_DAYS || '2';
+
+            // Deduplicate against recent security issues (open or closed)
+            const { data: recentIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'all',
+              sort: 'created',
+              direction: 'desc',
+              per_page: 50
+            });
+
+            const reportedCves = new Set();
+            const cveRegex = /CVE-\d{4}-\d+/gi;
+            for (const issue of recentIssues) {
+              if (issue.pull_request) continue;
+              const haystack = `${issue.title || ''}\n${issue.body || ''}`;
+              for (const match of haystack.matchAll(cveRegex)) {
+                reportedCves.add(match[0].toUpperCase());
+              }
+            }
+
+            const newCves = cves.filter((c) => !reportedCves.has(c.cveID.toUpperCase()));
+            if (newCves.length === 0) {
+              core.info('Tutte le CVE rilevate sono già state segnalate in issue precedenti. Nessuna nuova issue creata.');
+              return;
+            }
+
+            const formatPercent = (raw) => {
+              const num = Number.parseFloat(raw);
+              return Number.isFinite(num) ? `${(num * 100).toFixed(2)}%` : 'N/A';
+            };
+
+            const lines = newCves.map((v) => {
+              const cveUrl = `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(v.cveID)}`;
+              const epssText = v.epss
+                ? `${formatPercent(v.epss)} (percentile ${formatPercent(v.epssPercentile)})`
+                : 'N/A';
+              const ransomware = v.knownRansomwareCampaignUse === 'Known' ? ' ⚠️ **Ransomware: Known**' : '';
+              return [
+                `- **[${v.cveID}](${cveUrl})** — ${v.vulnerabilityName} (${v.vendorProject} / ${v.product})${ransomware}`,
+                `  - **Aggiunta KEV:** ${v.dateAdded} | **Scadenza CISA:** ${v.dueDate} | **EPSS:** ${epssText}`,
+                `  - **Azione richiesta:** ${v.requiredAction}`
+              ].join('\n');
+            });
+
+            const today = new Date().toISOString().slice(0, 10);
+            const noun = newCves.length === 1 ? 'nuova vulnerabilità' : 'nuove vulnerabilità';
+            const windowLabel = lookbackDays === '1' ? 'ultimo giorno' : `ultimi ${lookbackDays} giorni`;
+            const title = `⚠️ ALLERTA CRITICA CVE (${today}): ${newCves.length} ${noun} CISA KEV`;
+
+            const header = `### Vulnerabilità con exploit attivo confermato (${windowLabel})\n\n`;
+            const footer = '\n\n---\n*Verificare immediatamente se i runtime (Java LTS, Quarkus, OS/container) o i server sono impattati.*';
+            const maxBodyLength = 60000;
+            let listContent = lines.join('\n\n');
+            if (header.length + listContent.length + footer.length > maxBodyLength) {
+              const notice = '\n\n> ⚠️ Elenco troncato per limite di lunghezza GitHub Issue. Consultare i log del workflow per il dettaglio completo.';
+              const budget = maxBodyLength - header.length - footer.length - notice.length;
+              listContent = `${listContent.slice(0, Math.max(0, budget))}${notice}`;
+            }
+            const body = `${header}${listContent}${footer}`;
+
+            await core.summary.addRaw(body).write();
+
+            if (dryRun) {
+              core.info(`[DRY RUN] Creazione issue saltata. Titolo previsto: ${title}`);
+              return;
+            }
+
+            const { data: created } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['security', 'urgent']
+            });
+
+            core.info(`Issue di sicurezza creata: #${created.number} (${created.html_url})`);
